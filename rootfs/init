@@ -1,0 +1,169 @@
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+export PATH=/bin:/sbin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /sys/kernel/config /dev/pts /tmp
+mount -t configfs configfs /sys/kernel/config
+
+dmesg -n 1
+
+G=/sys/kernel/config/usb_gadget/g1
+if [ -d /sys/kernel/config/usb_gadget ]; then
+  mkdir $G
+  echo 0x1d6b > $G/idVendor
+  echo 0x0104 > $G/idProduct
+  mkdir $G/strings/0x409
+  echo "b4s4" > $G/strings/0x409/serialnumber
+  echo "b4s4" > $G/strings/0x409/product
+  echo "Google" > $G/strings/0x409/manufacturer
+  mkdir -p $G/configs/c.1/strings/0x409
+  echo "CDC" > $G/configs/c.1/strings/0x409/configuration
+  mkdir $G/functions/acm.0
+  ln -s $G/functions/acm.0 $G/configs/c.1/
+  UDC=$(ls /sys/class/udc | head -1)
+  echo $UDC > $G/UDC
+fi
+
+(
+  while true; do
+    [ -e /dev/ttyGS0 ] && sh -i < /dev/ttyGS0 > /dev/ttyGS0 2>&1
+    sleep 1
+  done
+) &
+
+E=$(printf '\033')
+R="${E}[0m"; D="${E}[2m"; C="${E}[36m"; GN="${E}[32m"; RD="${E}[31m"; YL="${E}[33m"; W="${E}[1;37m"
+K="${E}[K"
+
+human() {
+  kb=$(( $1 / 2 ))
+  if [ "$kb" -ge 1048576 ]; then
+    echo "$(( kb / 1048576 )).$(( (kb % 1048576) * 10 / 1048576 ))g"
+  elif [ "$kb" -ge 1024 ]; then
+    echo "$(( kb / 1024 ))m"
+  else
+    echo "${kb}k"
+  fi
+}
+
+kv() { printf "    ${C}%-9s${R} %s${K}\n" "$1" "$2"; }
+
+scan_parts() {
+  : > /tmp/parts.txt
+  for p in /sys/class/block/mmcblk0p*; do
+    [ -d "$p" ] || continue
+    dev=${p##*/}
+    name=$(sed -n 's/.*PARTNAME=\(.*\)/\1/p' $p/uevent 2>/dev/null)
+    [ -z "$name" ] && name="(unnamed)"
+    sz=$(cat $p/size 2>/dev/null); [ -z "$sz" ] && sz=0
+    echo "$name $dev $(human $sz)" >> /tmp/parts.txt
+  done
+}
+
+probe_mounts() {
+  : > /tmp/probe.txt
+  mkdir -p /tmp/m
+  for spec in system_a system_b vendor_a vendor_b userdata metadata persist; do
+    dev=$(awk -v n="$spec" '$1==n{print $2}' /tmp/parts.txt)
+    if [ -z "$dev" ]; then echo "$spec|-|-|missing" >> /tmp/probe.txt; continue; fi
+    fs=""
+    for t in ext4 f2fs vfat; do
+      if mount -t $t -o ro /dev/$dev /tmp/m 2>/dev/null; then fs=$t; break; fi
+    done
+    extra="-"
+    if [ -n "$fs" ]; then
+      case "$spec" in
+        system_*) extra=$(sed -n 's/^ro.build.display.id=\(.*\)/\1/p' /tmp/m/system/build.prop 2>/dev/null | head -1) ;;
+      esac
+      [ -z "$extra" ] && extra="-"
+      umount /tmp/m 2>/dev/null
+      echo "$spec|$dev|$fs|$extra" >> /tmp/probe.txt
+    else
+      echo "$spec|$dev|no fs|-" >> /tmp/probe.txt
+    fi
+  done
+}
+
+(
+  while [ ! -e /dev/fb0 ]; do sleep 1; done
+  sleep 1
+  zcat /logo.fb.gz > /dev/fb0 2>/dev/null
+  touch /tmp/.logo_done
+) &
+
+scan_parts
+probe_mounts
+
+render() {
+  {
+  printf "${E}[2;1H"
+  printf "    ${W}b4s4${R} ${D}· mainline bringup${R}${K}\n\n"
+  kv kernel  "$(uname -r)"
+  kv model   "$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)"
+  kv uptime  "$(cut -d. -f1 /proc/uptime)s · slot $(sed -n 's/.*androidboot.slot_suffix=\([^ ]*\).*/\1/p' /proc/cmdline)"
+  bdt=$(cat /proc/device-tree/firmware/android/boot_devices 2>/dev/null)
+  kv bootdev "${bdt:-none}"
+  printf "${K}\n"
+  cpus=$(cat /sys/devices/system/cpu/online 2>/dev/null)
+  maxf=$(cat /sys/devices/system/cpu/cpufreq/policy0/cpuinfo_max_freq 2>/dev/null)
+  [ -n "$maxf" ] && maxf="$(( maxf / 1000 ))mhz" || maxf="n/a"
+  kv cpu     "online ${cpus:-?} · max $maxf"
+  mt=$(awk '/MemTotal/{print $2}' /proc/meminfo); ma=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+  kv memory  "$(human $mt) total · $(human $ma) avail"
+  emmc=$(cat /sys/class/block/mmcblk0/size 2>/dev/null)
+  kv emmc    "mmcblk0 · $(human ${emmc:-0}) · $(wc -l < /tmp/parts.txt) parts"
+  printf "${K}\n"
+  printf "    ${W}partitions${R}${K}\n"
+  while IFS='|' read -r name dev fs extra; do
+    case "$fs" in
+      "no fs"|missing) col=$RD ;;
+      *) col=$GN ;;
+    esac
+    psz=$(awk -v d="$dev" '$2==d{print $3}' /tmp/parts.txt)
+    line="$name ${D}($dev)${R} ${psz:-?} ${col}${fs}${R}"
+    [ "$extra" != "-" ] && line="$line ${D}$extra${R}"
+    printf "    %b${K}\n" "$line"
+  done < /tmp/probe.txt
+
+  # bottom block (logo occupies the gap)
+  printf "${E}[46;1H"
+  printf "    ${W}hardware${R}${K}\n"
+  udc=$(ls /sys/class/udc 2>/dev/null | head -1)
+  gb=$(cat $G/UDC 2>/dev/null)
+  kv usb     "udc ${udc:-none} · ${gb:-unbound}"
+  fb=$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null | tr ',' 'x')
+  kv display "fb0 ${fb:-none}"
+  kv drm     "$(ls /sys/class/drm 2>/dev/null | tr '\n' ' ')"
+  gpu=$(dmesg 2>/dev/null | grep -im1 'adreno\|a6xx' | cut -c1-44)
+  kv gpu     "${gpu:-not probed}"
+  kv net     "$(ls /sys/class/net 2>/dev/null | tr '\n' ' ')"
+  if [ -d /sys/class/power_supply/battery ]; then
+    kv battery "$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)% · $(cat /sys/class/power_supply/battery/status 2>/dev/null)"
+  else
+    kv battery "${D}n/a${R}"
+  fi
+  th=""
+  for z in /sys/class/thermal/thermal_zone*; do
+    [ -d "$z" ] || continue
+    t=$(cat $z/temp 2>/dev/null); ty=$(cat $z/type 2>/dev/null | cut -c1-12)
+    [ -n "$t" ] && th="$th $ty:$(( t / 1000 ))°"
+    [ ${#th} -gt 44 ] && break
+  done
+  kv thermal "${th:-n/a}"
+  printf "${K}\n"
+  printf "    ${W}dmesg errors${R}${K}\n"
+  dmesg 2>/dev/null | grep -iE 'error|failed|panic|unable' | grep -viE 'probe deferr' | tail -3 | while read -r l; do
+    printf "    ${D}%.50s${R}${K}\n" "$l"
+  done
+  printf "${K}\n    ${D}ttyGS0 serial · refresh 4s${R}${K}\n"
+  } > /dev/tty0
+}
+
+while [ ! -e /tmp/.logo_done ]; do sleep 1; done
+while true; do
+  render
+  sleep 4
+done

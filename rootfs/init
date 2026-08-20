@@ -140,8 +140,20 @@ render() {
   gpu=$(dmesg 2>/dev/null | grep -im1 'adreno\|a6xx' | cut -c1-44)
   kv gpu     "${gpu:-not probed}"
   kv net     "$(ls /sys/class/net 2>/dev/null | tr '\n' ' ')"
-  if [ -d /sys/class/power_supply/battery ]; then
-    kv battery "$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)% · $(cat /sys/class/power_supply/battery/status 2>/dev/null)"
+  bat=""
+  for p in /sys/class/power_supply/*; do
+    [ -d "$p" ] || continue
+    [ "$(cat $p/type 2>/dev/null)" = "Battery" ] && bat=$p && break
+  done
+  if [ -n "$bat" ]; then
+    cap=$(cat $bat/capacity 2>/dev/null)
+    st=$(cat $bat/status 2>/dev/null | tr 'A-Z' 'a-z')
+    v=$(cat $bat/voltage_now 2>/dev/null)
+    [ -n "$v" ] && v="$(( v / 1000000 )).$(( (v % 1000000) / 100000 ))v"
+    mah=$(cat $bat/charge_full_design 2>/dev/null)
+    [ -n "$mah" ] && mah="$(( mah / 1000 )) mah"
+    col=$GN; [ "${cap:-100}" -le 20 ] && col=$RD
+    kv battery "${col}${cap:-?}%${R} · ${v:-?} · ${st:-?} ${D}(${mah:-?})${R}"
   else
     kv battery "${D}n/a${R}"
   fi
